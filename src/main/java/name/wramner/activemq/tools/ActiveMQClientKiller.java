@@ -19,12 +19,14 @@ import java.io.IOException;
 import java.net.MalformedURLException;
 import java.util.Set;
 
+import javax.management.AttributeNotFoundException;
 import javax.management.InstanceNotFoundException;
 import javax.management.MBeanException;
 import javax.management.MBeanServerConnection;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectInstance;
 import javax.management.ObjectName;
+import javax.management.OperationsException;
 import javax.management.ReflectionException;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
@@ -46,6 +48,7 @@ import com.sun.tools.attach.VirtualMachine;
  */
 public class ActiveMQClientKiller {
     private static final String CLIENT_CONNECTOR_OBJECT_NAME_PATTERN = "org.apache.activemq:type=Broker,connector=clientConnectors,connectionViewType=remoteAddress,*";
+    private static final String SUBSCRIBER_OBJECT_NAME_PATTERN_FMT = "org.apache.activemq:type=Broker,destinationName=%s,endpoint=Consumer,*";
 
     /**
      * Program entry point.
@@ -61,9 +64,11 @@ public class ActiveMQClientKiller {
                     String connectorAddress = virtualMachine.getAgentProperties()
                         .getProperty("com.sun.management.jmxremote.localConnectorAddress");
                     if (connectorAddress != null) {
-                        int stoppedConnections = stopClientConnections(connectToMBeanServer(connectorAddress),
-                            config.getClientIp(), config.getMaxConnections());
-
+                        int stoppedConnections = config.getDestinationName() != null
+                                ? stopSubscriberConnections(connectToMBeanServer(connectorAddress),
+                                    config.getDestinationName(), config.getMaxConnections(), config.isVerbose())
+                                : stopClientConnections(connectToMBeanServer(connectorAddress), config.getClientIp(),
+                                    config.getMaxConnections(), config.isVerbose());
                         if (stoppedConnections > 0) {
                             System.out.println("Stopped " + stoppedConnections + " client connections");
                         }
@@ -86,16 +91,34 @@ public class ActiveMQClientKiller {
         }
     }
 
-    private static int stopClientConnections(MBeanServerConnection conn, String clientIp, int maxConnectionsToStop)
-            throws IOException, MalformedObjectNameException, InstanceNotFoundException, MBeanException,
-            ReflectionException {
+    private static int stopClientConnections(MBeanServerConnection conn, String clientIp, int maxConnectionsToStop,
+            boolean verbose) throws IOException, MalformedObjectNameException, InstanceNotFoundException,
+            MBeanException, ReflectionException {
         String delimitedClientIp = "//" + clientIp + "_";
         int stoppedConnections = 0;
-        for (ObjectInstance oi : findConnectionViewMBeans(conn)) {
+        if (verbose) {
+            System.out.println("Finding ConnectionView MBeans...");
+        }
+        Set<ObjectInstance> mBeans = findConnectionViewMBeans(conn);
+        if (verbose) {
+            System.out.println("Processing " + mBeans.size() + " beans...");
+        }
+        for (ObjectInstance oi : mBeans) {
             if (oi.getClassName().equals("org.apache.activemq.broker.jmx.ConnectionView")) {
                 String connectionName = oi.getObjectName().getKeyProperty("connectionName");
                 if (connectionName != null && connectionName.contains(delimitedClientIp)) {
-                    conn.invoke(oi.getObjectName(), "stop", new Object[0], new String[0]);
+                    if (verbose) {
+                        System.out.println("Stopping " + connectionName + "...");
+                    }
+                    try {
+                        conn.invoke(oi.getObjectName(), "stop", new Object[0], new String[0]);
+                        if (verbose) {
+                            System.out.println("Stopped " + connectionName);
+                        }
+                    }
+                    catch (OperationsException e) {
+                        System.out.println("Failed to stop " + connectionName);
+                    }
                     if (++stoppedConnections >= maxConnectionsToStop) {
                         break;
                     }
@@ -103,6 +126,62 @@ public class ActiveMQClientKiller {
             }
         }
         return stoppedConnections;
+    }
+
+    private static int stopSubscriberConnections(MBeanServerConnection conn, String destinationName,
+            int maxConnectionsToStop, boolean verbose) throws IOException, MalformedObjectNameException,
+            InstanceNotFoundException, MBeanException, ReflectionException {
+        int stoppedConnections = 0;
+        if (verbose) {
+            System.out.println("Finding SubscriptionView MBeans for " + destinationName + "...");
+        }
+        Set<ObjectInstance> mBeans = findSubscriptionViewMBeans(conn, destinationName);
+        if (verbose) {
+            System.out.println("Processing " + mBeans.size() + " beans...");
+        }
+        for (ObjectInstance oi : mBeans) {
+            if (oi.getClassName().equals("org.apache.activemq.broker.jmx.SubscriptionView")) {
+                ObjectName connectionName = null;
+
+                if (oi.getObjectName().getKeyProperty("consumerId").indexOf("->") == -1) {
+                    try {
+                        connectionName = (ObjectName) conn.getAttribute(oi.getObjectName(), "Connection");
+                    }
+                    catch (InstanceNotFoundException e) {
+                        // Ignore, the connection is already closed
+                    }
+                    catch (AttributeNotFoundException e) {
+                        System.out.println("Connection attribute missing for " + oi.getObjectName() + " - ignoring");
+                    }
+                }
+                else if (verbose) {
+                    System.out.println("Skipping bridge " + oi.getObjectName());
+                }
+
+                if (connectionName != null) {
+                    if (verbose) {
+                        System.out.println("Stopping " + connectionName + "...");
+                    }
+                    try {
+                        conn.invoke(connectionName, "stop", new Object[0], new String[0]);
+                        if (verbose) {
+                            System.out.println("Stopped " + connectionName);
+                        }
+                        if (++stoppedConnections >= maxConnectionsToStop) {
+                            break;
+                        }
+                    }
+                    catch (OperationsException e) {
+                        if (verbose) {
+                            System.out.println("Failed to stop " + connectionName);
+                        }
+                    }
+                }
+
+            }
+        }
+        return stoppedConnections;
+
     }
 
     private static MBeanServerConnection connectToMBeanServer(String connectorAddress)
@@ -115,24 +194,42 @@ public class ActiveMQClientKiller {
         return conn.queryMBeans(new ObjectName(CLIENT_CONNECTOR_OBJECT_NAME_PATTERN), null);
     }
 
+    private static Set<ObjectInstance> findSubscriptionViewMBeans(MBeanServerConnection conn, String destinationName)
+            throws IOException, MalformedObjectNameException {
+        return conn.queryMBeans(new ObjectName(String.format(SUBSCRIBER_OBJECT_NAME_PATTERN_FMT, destinationName)),
+            null);
+    }
+
     private static boolean parseCommandLine(String[] args, Config config) {
         CmdLineParser parser = new CmdLineParser(config);
         try {
             parser.parseArgument(args);
-            return true;
+            if (config.getClientIp() != null || config.getDestinationName() != null) {
+                return true;
+            }
+            else {
+                System.out.println("Please specify IP address or destination name.");
+            }
         }
         catch (CmdLineException e) {
             System.out.println("Error: " + e.getMessage());
-            System.out.println("The supported options are:");
-            parser.printUsage(System.out);
-            System.out.println();
-            return false;
         }
+        printUsage(parser);
+        return false;
+    }
+
+    private static void printUsage(CmdLineParser parser) {
+        System.out.println("The supported options are:");
+        parser.printUsage(System.out);
+        System.out.println();
     }
 
     private static class Config {
-        @Option(name = "-a", aliases = { "--ip-address" }, usage = "IP address for client to kill", required = true)
+        @Option(name = "-a", aliases = { "--ip-address" }, usage = "IP address for client to kill")
         private String _clientIp;
+
+        @Option(name = "-d", aliases = { "--destination-name" }, usage = "Queue or topic name to kill clients for")
+        private String _destinationName;
 
         @Option(name = "-p", aliases = { "--pid" }, usage = "ActiveMQ process id", required = true)
         private int _processId;
@@ -140,6 +237,9 @@ public class ActiveMQClientKiller {
         @Option(name = "-c", aliases = {
                 "--max-connections-to-stop" }, usage = "Maximum number of client connections to stop", required = false)
         private Integer _maxConnections;
+
+        @Option(name = "-v", aliases = { "--verbose" }, usage = "Verbose logging")
+        private boolean _verbose;
 
         public String getClientIp() {
             return _clientIp;
@@ -151,6 +251,14 @@ public class ActiveMQClientKiller {
 
         public int getMaxConnections() {
             return _maxConnections != null ? _maxConnections.intValue() : Integer.MAX_VALUE;
+        }
+
+        public String getDestinationName() {
+            return _destinationName;
+        }
+
+        public boolean isVerbose() {
+            return _verbose;
         }
     }
 }
